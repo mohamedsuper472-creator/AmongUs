@@ -12,6 +12,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -28,11 +29,15 @@ public final class Game {
 	public enum Phase { LOBBY, PLAYING, DISCUSS, VOTE }
 
 	// ---- settings (change with /among set <key> <value>) ----
-	static int impostors = 0;        // 0 = automatic
+	static int impostors = 0;        // 0 = automatic   (/impostor <n>)
+	static int crewmates = 0;        // 0 = not set     (/crewmate <n>) -> lobby size and auto-start
 	static int shapeshifters = 1;
 	static int engineers = 1;
 	static int scientists = 1;
-	static int taskCount = 4;
+	static int easyTasks = 3;
+	static int mediumTasks = 4;
+	static int hardTasks = 3;
+	static int taskTime = 200;       // time limits of tasks, in percent (200 = twice as long)
 	static int killCd = 25;          // seconds
 	static int discuss = 20;         // seconds
 	static int voteTime = 30;        // seconds
@@ -40,7 +45,8 @@ public final class Game {
 	static int shiftDuration = 30;   // seconds
 	static int ventDuration = 7;     // engineer: seconds allowed inside the vents
 	static int ventCooldown = 30;    // engineer: seconds to wait before venting again
-	static int buttonCd = 15;        // emergency button cooldown (seconds), at game start and after every meeting
+	static int buttonCd = 15;        // emergency button cooldown (seconds)
+	static boolean o2Easy = false;   // true = the O2 code is also shown at the O2 keypad
 	static boolean redSword = true;
 
 	// ---- state ----
@@ -50,35 +56,37 @@ public final class Game {
 	static final Map<UUID, PState> players = new LinkedHashMap<>();
 	static final Set<String> dirtyNames = new HashSet<>();
 	static final List<Body> bodies = new ArrayList<>();
+	static final List<int[]> bloodSpots = new ArrayList<>();
+	static final ArrayDeque<Object> work = new ArrayDeque<>(); // build queue: String command | Integer wait | Runnable
 	static UUID host;
+	static String gameName;          // set by /among create (default: the creator's name)
+	static boolean gamePublic = true;
+	static String joinCode;          // private games
+	static final int MAX_PLAYERS = AmongColor.NAMES.length; // 20
 	static boolean testMode;
 	static boolean lightsOut;
+	static boolean[] lightsState = new boolean[0];
 	static int reactorTicks;
+	static int reactorHold;
+	static int o2Ticks;
+	static int o2CodeVal;
 	static int buttonLeft;
 	static int phaseTicks;
-	static int tickN;
+	static int autoCount = -1;
+	static int waitTicks;
+	static long tickN;
+	static boolean hudDirty;
 	private static final Random RNG = new Random();
 
 	static final class TaskRef {
 		final int idx;
+		int step;
 		boolean done;
+		long waitUntil;
+		int stage;
 
 		TaskRef(int idx) {
 			this.idx = idx;
-		}
-	}
-
-	static final class TaskRun {
-		final TaskRef ref;
-		final String type;
-		int timer;
-		int clicks;
-		int progress;
-		int code;
-
-		TaskRun(TaskRef ref, String type) {
-			this.ref = ref;
-			this.type = type;
 		}
 	}
 
@@ -99,6 +107,7 @@ public final class Game {
 	static final class PState {
 		final UUID id;
 		final String name;
+		int slot;
 		int color = -1;
 		Role role = Role.CREWMATE;
 		boolean alive = true;
@@ -114,7 +123,11 @@ public final class Game {
 		int vitalsLeft;
 		int votedFor = -2; // -2 = not voted, -1 = skip, else color index
 		final List<TaskRef> tasks = new ArrayList<>();
-		TaskRun run;
+		Tasks.Run run;
+		List<String> hudLines;
+		int mini;            // 0 = minimap in the sidebar (right), 1 = location bar at the top, 2 = off
+		String lastLoc = "";
+		boolean locBar;
 
 		PState(UUID id, String name) {
 			this.id = id;
@@ -193,6 +206,13 @@ public final class Game {
 			|| !sp.getItemBySlot(EquipmentSlot.FEET).isEmpty();
 	}
 
+	static double dist2(ServerPlayer sp, MapData.P q) {
+		double dx = sp.getX() - q.cx();
+		double dy = sp.getY() - q.y;
+		double dz = sp.getZ() - q.cz();
+		return dx * dx + dy * dy + dz * dz;
+	}
+
 	static List<PState> alive() {
 		List<PState> l = new ArrayList<>();
 		for (PState p : players.values()) if (p.alive) l.add(p);
@@ -204,8 +224,17 @@ public final class Game {
 		return null;
 	}
 
+	static int lobbyTarget() {
+		return crewmates > 0 ? Math.min(MAX_PLAYERS, Math.max(impostors, 1) + crewmates) : 0;
+	}
+
+	static String targetSuffix() {
+		int t = lobbyTarget();
+		return t > 0 ? "/" + t : "";
+	}
+
 	static void dress(String name, int rgb) {
-		String c = "[dyed_color=" + rgb + ",unbreakable={}]";
+		String c = "[dyed_color=" + rgb + ",unbreakable={},enchantments={\"minecraft:binding_curse\":1},enchantment_glint_override=false]";
 		cmd("item replace entity " + name + " armor.head with minecraft:leather_helmet" + c);
 		cmd("item replace entity " + name + " armor.chest with minecraft:leather_chestplate" + c);
 		cmd("item replace entity " + name + " armor.legs with minecraft:leather_leggings" + c);
@@ -223,62 +252,250 @@ public final class Game {
 		cmd("item replace entity " + name + " armor.chest with minecraft:air");
 		cmd("item replace entity " + name + " armor.legs with minecraft:air");
 		cmd("item replace entity " + name + " armor.feet with minecraft:air");
-		cmd("team leave " + name);
 		cmd("gamemode " + (adventure ? "adventure " : "survival ") + name);
 		if (!adventure) cmd("tag " + name + " remove amongus_in");
 	}
 
 	static void resetWorldState() {
 		bodies.clear();
-		cmd("kill @e[type=minecraft:armor_stand,tag=amongus_body]");
+		clearBodies();
 		cmd("bossbar remove amongus:tasks");
 		lightsOut = false;
 		reactorTicks = 0;
+		reactorHold = 0;
+		o2Ticks = 0;
 		phase = Phase.LOBBY;
 		testMode = false;
+		autoCount = -1;
+		hudDirty = true;
+	}
+
+
+	/** Dead body: a coloured chestplate + legs + bone lying flat on the floor, an interaction box to click, and blood. */
+	static void spawnBody(int color, double x, double y, double z) {
+		int rgb = AmongColor.RGB[color];
+		String dye = "components:{\"minecraft:dyed_color\":" + rgb + "}";
+		String rot = "left_rotation:[-0.7071f,0f,0f,0.7071f],right_rotation:[0f,0f,0f,1f]";
+		cmd("summon minecraft:item_display " + f(x) + " " + f(y + 0.04) + " " + f(z)
+			+ " {Tags:[\"amongus_body\"],item:{id:\"minecraft:leather_chestplate\",count:1," + dye + "},item_display:\"fixed\","
+			+ "transformation:{" + rot + ",translation:[0f,0f,-0.2f],scale:[1.6f,1.6f,1.6f]}}");
+		cmd("summon minecraft:item_display " + f(x) + " " + f(y + 0.04) + " " + f(z)
+			+ " {Tags:[\"amongus_body\"],item:{id:\"minecraft:leather_leggings\",count:1," + dye + "},item_display:\"fixed\","
+			+ "transformation:{" + rot + ",translation:[0f,0f,0.45f],scale:[1.6f,1.6f,1.6f]}}");
+		cmd("summon minecraft:item_display " + f(x) + " " + f(y + 0.06) + " " + f(z)
+			+ " {Tags:[\"amongus_body\"],item:{id:\"minecraft:bone\",count:1},item_display:\"fixed\","
+			+ "transformation:{" + rot + ",translation:[0.5f,0f,-0.5f],scale:[0.8f,0.8f,0.8f]}}");
+		cmd("summon minecraft:interaction " + f(x) + " " + f(y) + " " + f(z)
+			+ " {Tags:[\"amongus_body\"],width:1.4f,height:0.6f,response:1b}");
+		// blood: red carpets around the body (only on empty floor) + a red splash
+		int bx = (int) Math.floor(x);
+		int bz = (int) Math.floor(z);
+		int by = (int) Math.floor(y);
+		int[][] spots = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, -1}};
+		for (int[] sp : spots) {
+			if (sp[0] != 0 && sp[1] != 0 && RNG.nextBoolean()) continue;
+			int px = bx + sp[0];
+			int pz = bz + sp[1];
+			cmd("fill " + px + " " + by + " " + pz + " " + px + " " + by + " " + pz + " minecraft:red_carpet replace minecraft:air");
+			bloodSpots.add(new int[] {px, by, pz});
+		}
+		cmd("particle minecraft:block{block_state:\"minecraft:redstone_block\"} " + f(x) + " " + f(y + 0.3) + " " + f(z) + " 0.4 0.3 0.4 0.05 60");
+	}
+
+	static void clearBodies() {
+		cmd("kill @e[tag=amongus_body]");
+		for (int[] b : bloodSpots) {
+			cmd("fill " + b[0] + " " + b[1] + " " + b[2] + " " + b[0] + " " + b[1] + " " + b[2] + " minecraft:air replace minecraft:red_carpet");
+		}
+		bloodSpots.clear();
+	}
+
+	static void reward(PState p, int coins) {
+		Stats.get(p.id).coins += coins;
+		hudDirty = true;
 	}
 
 	// =====================================================================
-	// lobby: join / leave / menu
+	// lobby: join / leave / menu / settings
 	// =====================================================================
 
 	static void menu(ServerPlayer sp) {
 		String n = sp.getName().getString();
 		raw(n, txt("=== AMONG US ===", "gold"));
-		raw(n, "[" + btn("JOIN", "green", "/among join") + "," + btn("LEAVE", "red", "/among leave") + ","
+		raw(n, "[" + btn("CREATE", "aqua", "/among create") + "," + btn("JOIN", "green", "/among join") + "," + btn("LEAVE", "red", "/among leave") + ","
 			+ btn("START", "yellow", "/among start") + "," + btn("STATUS", "aqua", "/among status") + ","
-			+ btn("HELP", "white", "/among help") + "]");
+			+ btn("STATS", "gold", "/among stats") + "," + btn("HELP", "white", "/among help") + "]");
 	}
 
 	static void help(ServerPlayer sp) {
 		String n = sp.getName().getString();
 		String[] lines = {
-			"/among join | leave | start [force] | stop | status | tasks",
+			"/among create [name] | public | private [code] | rename <name> | games | join [name] [code]",
+			"/among start [force] | stop | leave | status | stats | tasks | minimap right|top|off",
+			"/impostor <n>  /crewmate <n>  - how many impostors / crewmates (lobby starts itself when full)",
 			"/among report - report a nearby body (or right-click it)",
-			"/among vote <color|skip> - during voting (buttons appear in chat)",
-			"/among code <number> - for 'code' tasks",
-			"/among sabotage lights|reactor - impostors",
+			"/among vote <color|skip> - during voting (a vote screen opens; /among vote reopens it)",
+			"/among code <number> - for 'code' tasks;  /among o2 <code> - fix O2",
+			"/among sabotage lights|o2|reactor - impostors",
 			"/among shift <color> - shapeshifter | /among vitals - scientist",
 			"/among set <key> <value> - settings (see /among status)",
-			"/among map buildmap - builds the whole map where you stand",
-			"Emergency meeting = press the red button in the middle of the Cafeteria.",
-			"Tasks = lecterns. Vents = iron trapdoors on the floor: just right-click them (sneak+click = go back)."
+			"/among map buildmap - builds the big Skeld map where you stand",
+			"Emergency meeting = the red button in the middle of the Cafeteria.",
+			"Tasks = lecterns (green=easy, yellow=medium, red=very hard). Vents = iron trapdoors (click)."
 		};
 		for (String l : lines) tell(n, l, "gray");
 	}
 
 	static void status(ServerPlayer sp) {
 		String n = sp.getName().getString();
-		tell(n, "Phase: " + phase + " | Players: " + players.size() + "/" + AmongColor.NAMES.length
-			+ " | Map ready: " + map.ready(), "yellow");
-		tell(n, "impostors=" + impostors + " (0=auto) shapeshifters=" + shapeshifters + " engineers=" + engineers
-			+ " scientists=" + scientists + " tasks=" + taskCount, "gray");
-		tell(n, "killcd=" + killCd + " discuss=" + discuss + " vote=" + voteTime + " meetings=" + meetings
-			+ " shiftduration=" + shiftDuration + " ventduration=" + ventDuration + " ventcooldown=" + ventCooldown + " buttoncd=" + buttonCd + " redsword=" + (redSword ? 1 : 0), "gray");
+		tell(n, "Game: " + (gameName == null ? "none (use /among create)" : gameName + (gamePublic ? " [public]"
+			: " [private" + (host != null && host.equals(sp.getUUID()) ? ", code " + joinCode : "") + "]")), "gold");
+		tell(n, "Phase: " + phase + " | Players: " + players.size() + "/" + MAX_PLAYERS
+			+ " | Map ready: " + map.ready() + " | Lobby target: " + (lobbyTarget() > 0 ? lobbyTarget() : "none"), "yellow");
+		tell(n, "impostors=" + impostors + " (0=auto) crewmates=" + crewmates + " shapeshifters=" + shapeshifters
+			+ " engineers=" + engineers + " scientists=" + scientists, "gray");
+		tell(n, "easytasks=" + easyTasks + " mediumtasks=" + mediumTasks + " hardtasks=" + hardTasks + " tasktime=" + taskTime + "%"
+			+ " killcd=" + killCd + " discuss=" + discuss + " vote=" + voteTime + " meetings=" + meetings, "gray");
+		tell(n, "shiftduration=" + shiftDuration + " ventduration=" + ventDuration + " ventcooldown=" + ventCooldown
+			+ " buttoncd=" + buttonCd + " o2easy=" + (o2Easy ? 1 : 0) + " redsword=" + (redSword ? 1 : 0), "gray");
 	}
 
-	static void join(ServerPlayer sp) {
+	static void stats(ServerPlayer sp) {
+		String n = sp.getName().getString();
+		Stats.S s = Stats.get(sp.getUUID());
+		tell(n, "--- Your stats ---", "gold");
+		tell(n, "Coins: " + s.coins + " | Wins: " + s.wins + " | Games: " + s.games, "yellow");
+		tell(n, "Kills: " + s.kills + " | Tasks completed: " + s.tasks, "yellow");
+	}
+
+	static void setImpostors(ServerPlayer sp, Integer n) {
 		String name = sp.getName().getString();
+		if (n == null) {
+			tell(name, "Impostors: " + (impostors == 0 ? "auto" : String.valueOf(impostors)) + " (use /impostor <number>, 0 = auto)", "yellow");
+			return;
+		}
+		if (phase != Phase.LOBBY) {
+			tell(name, "Can't change this during a game.", "red");
+			return;
+		}
+		impostors = Math.min(n, 4);
+		tellAll("Impostors set to " + (impostors == 0 ? "auto" : String.valueOf(impostors)) + "." + lobbyHint(), "green");
+		hudDirty = true;
+	}
+
+	static void setCrewmates(ServerPlayer sp, Integer n) {
+		String name = sp.getName().getString();
+		if (n == null) {
+			tell(name, "Crewmates: " + (crewmates == 0 ? "not set" : String.valueOf(crewmates)) + " (use /crewmate <number>)", "yellow");
+			return;
+		}
+		if (phase != Phase.LOBBY) {
+			tell(name, "Can't change this during a game.", "red");
+			return;
+		}
+		crewmates = Math.min(n, MAX_PLAYERS - 1);
+		tellAll("Crewmates set to " + (crewmates == 0 ? "not set" : String.valueOf(crewmates)) + "." + lobbyHint(), "green");
+		hudDirty = true;
+	}
+
+	private static String lobbyHint() {
+		int t = lobbyTarget();
+		return t > 0 ? " The game starts by itself when " + t + " players have joined." : "";
+	}
+
+	/** /among create [name] - makes a game named after the creator (or the given name). */
+	static void create(ServerPlayer sp, String name) {
+		String me = sp.getName().getString();
+		if (phase != Phase.LOBBY) {
+			tell(me, "A game is running right now.", "red");
+			return;
+		}
+		if (gameName != null && host != null && !sp.getUUID().equals(host)) {
+			tell(me, "A game already exists: " + gameName + " (host " + (players.containsKey(host) ? players.get(host).name : "?")
+				+ "). Join it with /among join, or wait for it to end.", "red");
+			return;
+		}
+		if (map.lobby == null) {
+			tell(me, "No map yet. Stand in a big flat area and run /among map buildmap", "red");
+			return;
+		}
+		boolean first = gameName == null;
+		gameName = name == null || name.isBlank() ? me : name;
+		gamePublic = true;
+		joinCode = null;
+		host = sp.getUUID();
+		if (!players.containsKey(sp.getUUID())) joinInternal(sp);
+		tell(me, "Game '" + gameName + "' created (PUBLIC, max " + MAX_PLAYERS + " players).", "green");
+		raw(me, "[" + btn("MAKE PRIVATE", "gold", "/among private") + "," + btn("START", "yellow", "/among start") + "]");
+		if (first) announce();
+	}
+
+	static void announce() {
+		if (server == null || gameName == null) return;
+		for (ServerPlayer o : server.getPlayerList().getPlayers()) {
+			String n = o.getName().getString();
+			if (players.containsKey(o.getUUID())) continue;
+			if (gamePublic) {
+				raw(n, "[" + txt("Among Us game '" + gameName + "' is open!  ", "gold") + "," + btn("JOIN", "green", "/among join " + gameName) + "]");
+			}
+		}
+	}
+
+	static void rename(ServerPlayer sp, String name) {
+		String me = sp.getName().getString();
+		if (gameName == null || !sp.getUUID().equals(host)) {
+			tell(me, "Only the host of a game can rename it. Create one with /among create", "red");
+			return;
+		}
+		gameName = name;
+		tellAll("The game is now called '" + gameName + "'.", "gold");
+	}
+
+	static void setPublic(ServerPlayer sp) {
+		String me = sp.getName().getString();
+		if (gameName == null || !sp.getUUID().equals(host)) {
+			tell(me, "Only the host of a game can do that.", "red");
+			return;
+		}
+		gamePublic = true;
+		joinCode = null;
+		tellAll("The game is now PUBLIC.", "green");
+		announce();
+	}
+
+	static void setPrivate(ServerPlayer sp, String code) {
+		String me = sp.getName().getString();
+		if (gameName == null || !sp.getUUID().equals(host)) {
+			tell(me, "Only the host of a game can do that.", "red");
+			return;
+		}
+		gamePublic = false;
+		joinCode = code == null || code.isBlank() ? String.valueOf(1000 + RNG.nextInt(9000)) : code;
+		tellAll("The game is now PRIVATE.", "gold");
+		tell(me, "Join code: " + joinCode + "  (friends join with /among join " + gameName + " " + joinCode + ")", "aqua");
+	}
+
+	static void games(ServerPlayer sp) {
+		String me = sp.getName().getString();
+		if (gameName == null) {
+			tell(me, "No game right now. Make one with /among create", "yellow");
+			return;
+		}
+		String hostName = host != null && players.containsKey(host) ? players.get(host).name : "?";
+		tell(me, "Game: " + gameName + " | host " + hostName + " | " + players.size() + "/" + MAX_PLAYERS + " | "
+			+ (gamePublic ? "PUBLIC" : "PRIVATE (code needed)") + " | " + phase, "yellow");
+		if (gamePublic && phase == Phase.LOBBY && !players.containsKey(sp.getUUID())) {
+			raw(me, "[" + btn("JOIN", "green", "/among join " + gameName) + "]");
+		}
+	}
+
+	/** /among join [name] [code] */
+	static void join(ServerPlayer sp, String a, String b) {
+		String name = sp.getName().getString();
+		if (gameName == null) {
+			tell(name, "There is no game yet. The host creates one with /among create", "red");
+			return;
+		}
 		if (phase != Phase.LOBBY) {
 			tell(name, "A game is running. Wait for it to end.", "red");
 			return;
@@ -287,28 +504,74 @@ public final class Game {
 			tell(name, "You already joined.", "yellow");
 			return;
 		}
-		if (players.size() >= AmongColor.NAMES.length) {
-			tell(name, "The game is full (" + AmongColor.NAMES.length + ").", "red");
+		if (a != null && !a.equalsIgnoreCase(gameName) && !a.equals(joinCode)) {
+			tell(name, "No game named '" + a + "'. Open game: " + gameName, "red");
+			return;
+		}
+		if (!gamePublic && !(joinCode != null && (joinCode.equals(a) || joinCode.equals(b)))) {
+			tell(name, "This game is PRIVATE. Use /among join " + gameName + " <code>", "red");
+			return;
+		}
+		if (players.size() >= MAX_PLAYERS) {
+			tell(name, "The game is full (" + MAX_PLAYERS + ").", "red");
 			return;
 		}
 		if (map.lobby == null) {
-			tell(name, "No map yet. Stand in an open flat area and run /among map buildmap", "red");
+			tell(name, "No map yet. Stand in a big flat area and run /among map buildmap", "red");
 			return;
 		}
 		if (hasArmor(sp)) {
 			tell(name, "Take off your armor first (it would be replaced during the game).", "red");
 			return;
 		}
+		joinInternal(sp);
+	}
+
+	private static void joinInternal(ServerPlayer sp) {
+		String name = sp.getName().getString();
 		PState p = new PState(sp.getUUID(), name);
+		boolean[] used = new boolean[MAX_PLAYERS];
+		for (PState o : players.values()) used[o.slot] = true;
+		for (int i = 0; i < used.length; i++) {
+			if (!used[i]) {
+				p.slot = i;
+				break;
+			}
+		}
 		players.put(sp.getUUID(), p);
 		if (host == null) host = p.id;
 		cmd("tag " + name + " add amongus_in");
 		cmd("gamemode adventure " + name);
 		tp(name, map.lobby.cx(), map.lobby.y, map.lobby.cz());
-		tellAll(name + " joined (" + players.size() + "/" + AmongColor.NAMES.length + ")", "green");
+		Hud.setup(p);
+		tellAll(name + " joined '" + gameName + "' (" + players.size() + targetSuffix() + (lobbyTarget() > 0 ? "" : "/" + MAX_PLAYERS) + ")", "green");
+		hudDirty = true;
 		if (p.id.equals(host)) {
-			tell(name, "You are the host. Start the game with /among start when everyone joined.", "gold");
+			tell(name, "You are the host. Start with /among start, or set /impostor and /crewmate and the game starts when full.", "gold");
 		}
+	}
+
+	static void minimap(ServerPlayer sp, String mode) {
+		PState p = players.get(sp.getUUID());
+		String n = sp.getName().getString();
+		if (p == null) {
+			tell(n, "Join a game first.", "red");
+			return;
+		}
+		switch (mode) {
+			case "right" -> p.mini = 0;
+			case "top" -> p.mini = 1;
+			case "off" -> p.mini = 2;
+			default -> {
+				tell(n, "Use /among minimap right | top | off", "red");
+				return;
+			}
+		}
+		Hud.clearLoc(p);
+		p.lastLoc = "";
+		p.hudLines = null;
+		hudDirty = true;
+		tell(n, "Minimap: " + mode + (p.slot >= Hud.TEAM_COLORS.length ? " (players 17-20 always get the top bar)" : ""), "green");
 	}
 
 	static void leave(UUID id, boolean disconnected) {
@@ -319,19 +582,22 @@ public final class Game {
 			tellAll(label(p) + " left the game.", "gray");
 		}
 		players.remove(id);
+		Hud.teardown(p);
 		if (disconnected) dirtyNames.add(p.name);
 		else cleanupPlayer(p.name, false);
 		if (p.id.equals(host)) {
 			host = players.isEmpty() ? null : players.keySet().iterator().next();
-			if (host != null) {
-				PState h = players.get(host);
-				tellAll(h.name + " is now the host.", "gold");
-			}
+			if (host != null) tellAll(players.get(host).name + " is now the host.", "gold");
 		}
 		if (players.isEmpty()) {
 			resetWorldState();
+			gameName = null;
+			host = null;
+			joinCode = null;
+			gamePublic = true;
 			return;
 		}
+		hudDirty = true;
 		if (phase != Phase.LOBBY) {
 			updateBar();
 			checkWin();
@@ -344,8 +610,10 @@ public final class Game {
 		if (dirtyNames.remove(name)) {
 			cleanupPlayer(name, false);
 		}
-		if (map.ready()) {
-			raw(name, "[" + txt("Among Us is on this server!  ", "gold") + "," + btn("CLICK TO JOIN", "green", "/among join") + "]");
+		if (gameName != null && gamePublic && phase == Phase.LOBBY) {
+			raw(name, "[" + txt("Among Us game '" + gameName + "' is open!  ", "gold") + "," + btn("JOIN", "green", "/among join " + gameName) + "]");
+		} else if (map.ready()) {
+			raw(name, "[" + txt("Among Us is on this server. ", "gold") + "," + btn("CREATE A GAME", "green", "/among create") + "]");
 		}
 	}
 
@@ -355,6 +623,10 @@ public final class Game {
 
 	static void startCmd(ServerPlayer sp, boolean force) {
 		String name = sp.getName().getString();
+		if (gameName == null) {
+			tell(name, "Create a game first: /among create", "red");
+			return;
+		}
 		if (host != null && !sp.getUUID().equals(host)) {
 			tell(name, "Only the host (" + players.get(host).name + ") can start the game.", "red");
 			return;
@@ -363,9 +635,21 @@ public final class Game {
 		if (err != null) tell(name, err, "red");
 	}
 
+	static void assignTasks(PState p) {
+		p.tasks.clear();
+		for (int diff = 1; diff <= 3; diff++) {
+			int want = diff == 1 ? easyTasks : diff == 2 ? mediumTasks : hardTasks;
+			List<Integer> pool = new ArrayList<>();
+			for (int i = 0; i < map.tasks.size(); i++) if (map.tasks.get(i).diff == diff) pool.add(i);
+			Collections.shuffle(pool, RNG);
+			for (int i = 0; i < Math.min(want, pool.size()); i++) p.tasks.add(new TaskRef(pool.get(i)));
+		}
+	}
+
 	static String start(boolean force) {
 		if (phase != Phase.LOBBY) return "A game is already running.";
 		if (!map.ready()) return "No map yet. Run /among map buildmap first.";
+		if (!work.isEmpty()) return "The map is still being built. Wait for it to finish.";
 		int n = players.size();
 		if (n < 1) return "Nobody joined. Use /among join.";
 		if (n < 3 && !force) return "Need at least 3 players. (/among start force = solo test mode)";
@@ -388,7 +672,6 @@ public final class Game {
 			p.color = cols.get(i);
 			p.role = Role.CREWMATE;
 			p.alive = true;
-			p.tasks.clear();
 			p.run = null;
 			p.killCd = 10 * 20;
 			p.sabCd = 15 * 20;
@@ -403,7 +686,7 @@ public final class Game {
 			p.votedFor = -2;
 		}
 
-		int nImp = impostors > 0 ? impostors : (n >= 7 ? 2 : 1);
+		int nImp = impostors > 0 ? impostors : (n >= 14 ? 3 : n >= 7 ? 2 : 1);
 		if (n < 3) nImp = n == 2 ? 1 : 0;
 		else nImp = Math.min(nImp, (n - 1) / 2);
 		int nShape = Math.min(shapeshifters, nImp);
@@ -412,36 +695,24 @@ public final class Game {
 			list.get(idx++).role = i < nShape ? Role.SHAPESHIFTER : Role.IMPOSTOR;
 		}
 		int nEng = Math.min(engineers, n - idx);
-		for (int i = 0; i < nEng; i++) {
-			PState p = list.get(idx++);
-			p.role = Role.ENGINEER;
-		}
+		for (int i = 0; i < nEng; i++) list.get(idx++).role = Role.ENGINEER;
 		int nSci = Math.min(scientists, n - idx);
 		for (int i = 0; i < nSci; i++) list.get(idx++).role = Role.SCIENTIST;
 
-		// tasks for crew
-		for (PState p : list) {
-			if (p.role.impostor) continue;
-			List<Integer> all = new ArrayList<>();
-			for (int i = 0; i < map.tasks.size(); i++) all.add(i);
-			Collections.shuffle(all, RNG);
-			int take = Math.min(taskCount, all.size());
-			for (int i = 0; i < take; i++) p.tasks.add(new TaskRef(all.get(i)));
-		}
+		// tasks: everyone gets a list; impostors' list is fake (they can't finish them)
+		for (PState p : list) assignTasks(p);
 
-		// world setup
 		bodies.clear();
-		cmd("kill @e[type=minecraft:armor_stand,tag=amongus_body]");
+		clearBodies();
 		lightsOut = false;
 		reactorTicks = 0;
-		cmd("team add among_hide");
-		cmd("team modify among_hide nametagVisibility never");
-		cmd("team modify among_hide collisionRule never");
+		reactorHold = 0;
+		o2Ticks = 0;
+		for (int k = 0; k < map.switches.size(); k++) setLever(k, true);
 
 		for (PState p : list) {
 			cmd("effect clear " + p.name);
-			cmd("tag " + p.name + " add amongus_in");
-			cmd("team join among_hide " + p.name);
+			Hud.hideNames(p, true);
 			cmd("gamemode adventure " + p.name);
 			cmd("effect give " + p.name + " minecraft:invisibility infinite 0 true");
 			cmd("effect give " + p.name + " minecraft:saturation infinite 0 true");
@@ -461,6 +732,7 @@ public final class Game {
 
 		phase = Phase.PLAYING;
 		buttonLeft = buttonCd * 20;
+		autoCount = -1;
 
 		for (PState p : list) {
 			title(p.name, p.role.display.toUpperCase(Locale.ROOT), "You are " + AmongColor.label(p.color), p.role.color);
@@ -474,10 +746,12 @@ public final class Game {
 					}
 				}
 				tell(p.name, sb.length() == 0 ? "You are the only impostor." : "Fellow impostors: " + sb, "red");
+				tell(p.name, "Your task list on screen is FAKE - pretend to do tasks to blend in.", "gray");
 			} else {
-				tell(p.name, "Your tasks: /among tasks", "gray");
+				tell(p.name, "Your tasks are in the box on the right. More info: /among tasks", "gray");
 			}
 		}
+		Hud.refreshAll(true);
 		if (testMode) tellAll("TEST MODE: fewer than 3 players, the game will not end by itself. Use /among stop.", "yellow");
 		return null;
 	}
@@ -505,12 +779,13 @@ public final class Game {
 	static void gather(double radius) {
 		List<PState> al = alive();
 		int n = al.size();
+		radius = Math.max(radius, n * 0.5);
 		MapData.P c = map.button;
+		double floorY = map.lobby != null ? map.lobby.y : c.y;
 		for (int i = 0; i < n; i++) {
 			double a = 2 * Math.PI * i / Math.max(n, 1);
 			double x = c.cx() + radius * Math.cos(a);
 			double z = c.cz() + radius * Math.sin(a);
-			double floorY = map.lobby != null ? map.lobby.y : c.y;
 			cmd("tp " + al.get(i).name + " " + f(x) + " " + f(floorY) + " " + f(z)
 				+ " facing " + f(c.cx()) + " " + f(c.y) + " " + f(c.cz()));
 		}
@@ -520,21 +795,45 @@ public final class Game {
 	// main tick
 	// =====================================================================
 
+	static void pump() {
+		if (waitTicks > 0) {
+			waitTicks--;
+			return;
+		}
+		int n = 0;
+		while (!work.isEmpty() && n < 40) {
+			Object o = work.poll();
+			if (o instanceof String s) {
+				cmd(s);
+				n++;
+			} else if (o instanceof Integer w) {
+				waitTicks = w;
+				return;
+			} else if (o instanceof Runnable r) {
+				r.run();
+			}
+		}
+	}
+
 	static void tick(MinecraftServer s) {
 		server = s;
+		pump();
 		if (players.isEmpty()) return;
 		tickN++;
 
-		if (phase == Phase.LOBBY) {
-			if (tickN % 100 == 0 && host != null) {
-				PState h = players.get(host);
-				for (PState p : players.values()) {
-					bar(p.name, "Lobby: " + players.size() + " player(s). Host (" + (h == null ? "?" : h.name) + ") starts with /among start", "yellow");
-				}
-			}
-			return;
+		if (hudDirty || tickN % 10 == 0) {
+			hudDirty = false;
+			Hud.refreshAll(false);
+		}
+		if (phase != Phase.LOBBY && tickN % 20 == 0) {
+			// no night vision cheating
+			for (PState p : players.values()) cmd("effect clear " + p.name + " minecraft:night_vision");
 		}
 
+		if (phase == Phase.LOBBY) {
+			lobbyTick();
+			return;
+		}
 		if (phase == Phase.DISCUSS) {
 			if (--phaseTicks <= 0) beginVoting();
 			else if (tickN % 20 == 0) {
@@ -581,7 +880,7 @@ public final class Game {
 				p.shiftCd--;
 			}
 
-			if (p.run != null) runTask(p, sp);
+			if (p.run != null) Tasks.tick(p, sp);
 
 			if (tickN % 40 == 0) {
 				if (sp.getItemBySlot(EquipmentSlot.HEAD).isEmpty() || sp.getItemBySlot(EquipmentSlot.CHEST).isEmpty()
@@ -589,20 +888,41 @@ public final class Game {
 					dress(p.name, AmongColor.RGB[shownColor(p)]);
 				}
 			}
-			if (tickN % 10 == 0 && p.run == null && p.ventLeft == 0) hud(p);
+			if (lightsOut && tickN % 100 == 0 && !p.role.impostor) {
+				cmd("effect give " + p.name + " minecraft:blindness infinite 0 true");
+			}
+			if (tickN % 10 == 0 && p.run == null && p.ventLeft == 0 && !sabotageActive()) hud(p);
 		}
+		if (phase == Phase.PLAYING) sabotageTick();
+	}
 
-		if (reactorTicks > 0 && phase == Phase.PLAYING) {
-			reactorTicks--;
-			if (tickN % 10 == 0) {
-				for (PState p : alive()) {
-					if (!p.role.impostor) bar(p.name, "REACTOR MELTDOWN in " + (reactorTicks / 20) + "s! Click the reactor panel (Reactor room)", "red");
+	static boolean sabotageActive() {
+		return reactorTicks > 0 || o2Ticks > 0;
+	}
+
+	static void lobbyTick() {
+		if (tickN % 100 == 0 && host != null) {
+			PState h = players.get(host);
+			for (PState p : players.values()) {
+				bar(p.name, "Lobby '" + gameName + "': " + players.size() + targetSuffix() + " player(s). Host (" + (h == null ? "?" : h.name)
+					+ ") starts with /among start", "yellow");
+			}
+		}
+		int target = lobbyTarget();
+		if (target > 0 && players.size() >= target && map.ready() && work.isEmpty()) {
+			if (autoCount < 0) {
+				autoCount = 200;
+				tellAll("The lobby is full! The game starts in 10 seconds...", "gold");
+			}
+			if (--autoCount == 0) {
+				String err = start(target < 3);
+				if (err != null) {
+					tellAll("Can't start: " + err, "red");
+					autoCount = -1;
 				}
 			}
-			if (reactorTicks == 0) {
-				if (!testMode) endGame(false, "The reactor melted down!");
-				else tellAll("Reactor meltdown (test mode, game continues).", "red");
-			}
+		} else {
+			autoCount = -1;
 		}
 	}
 
@@ -629,100 +949,23 @@ public final class Game {
 	// tasks
 	// =====================================================================
 
-	static boolean taskClick(PState p, BlockPos pos) {
-		for (int i = 0; i < map.tasks.size(); i++) {
-			MapData.TaskDef def = map.tasks.get(i);
-			if (!def.pos.is(pos)) continue;
-			if (p.role.impostor) {
-				bar(p.name, "Fake task: " + def.name + " (impostors can't finish tasks)", "gray");
-				return true;
-			}
-			TaskRef ref = null;
-			for (TaskRef t : p.tasks) if (t.idx == i) ref = t;
-			if (ref == null) {
-				bar(p.name, "That is not one of your tasks.", "gray");
-				return true;
-			}
-			if (ref.done) {
-				bar(p.name, "You already finished: " + def.name, "gray");
-				return true;
-			}
-			if (p.run != null && p.run.ref == ref) {
-				if ("click".equals(def.type)) {
-					p.run.clicks++;
-					bar(p.name, def.name + ": " + p.run.clicks + "/5 clicks", "aqua");
-					if (p.run.clicks >= 5) completeTask(p, ref, def);
-				}
-				return true;
-			}
-			TaskRun run = new TaskRun(ref, def.type);
-			p.run = run;
-			switch (def.type) {
-				case "click" -> {
-					run.clicks = 1;
-					run.timer = 200;
-					bar(p.name, def.name + ": click the station 5 times in 10 seconds (1/5)", "aqua");
-				}
-				case "hold" -> {
-					run.timer = 100;
-					bar(p.name, def.name + ": stay close to the station for 5 seconds...", "aqua");
-				}
-				default -> {
-					run.code = 1000 + RNG.nextInt(9000);
-					run.timer = 400;
-					tell(p.name, def.name + ": type /among code " + run.code + " within 20 seconds", "aqua");
-					title(p.name, "CODE: " + run.code, "/among code " + run.code, "aqua");
-				}
-			}
-			return true;
-		}
-		return false;
-	}
-
-	static void runTask(PState p, ServerPlayer sp) {
-		TaskRun run = p.run;
-		MapData.TaskDef def = map.tasks.get(run.ref.idx);
-		if ("hold".equals(run.type)) {
-			double dx = sp.getX() - def.pos.cx();
-			double dy = sp.getY() - def.pos.y;
-			double dz = sp.getZ() - def.pos.cz();
-			if (dx * dx + dy * dy + dz * dz > 16.0) {
-				p.run = null;
-				bar(p.name, "Task cancelled - you moved away.", "red");
-				return;
-			}
-			run.progress++;
-			if (run.progress % 10 == 0) bar(p.name, def.name + ": " + (run.progress) + "%", "aqua");
-			if (run.progress >= 100) completeTask(p, run.ref, def);
-			return;
-		}
-		if (--run.timer <= 0) {
-			p.run = null;
-			bar(p.name, "Task failed (too slow). Try again.", "red");
-		}
-	}
-
-	static void enterCode(ServerPlayer sp, int code) {
-		PState p = players.get(sp.getUUID());
-		if (p == null || phase != Phase.PLAYING || !p.alive) return;
-		if (p.run == null || !"code".equals(p.run.type)) {
-			tell(p.name, "You don't have a code task active. Click a task station first.", "gray");
-			return;
-		}
-		if (p.run.code != code) {
-			tell(p.name, "Wrong code!", "red");
-			return;
-		}
-		completeTask(p, p.run.ref, map.tasks.get(p.run.ref.idx));
-	}
-
 	static void completeTask(PState p, TaskRef ref, MapData.TaskDef def) {
 		ref.done = true;
 		p.run = null;
-		tell(p.name, "Task complete: " + def.name, "green");
+		int coins = def.diff == 1 ? 10 : def.diff == 2 ? 20 : 40;
+		Stats.S st = Stats.get(p.id);
+		st.tasks++;
+		st.coins += coins;
+		Stats.save();
+		tell(p.name, "Task complete: " + def.name + " [" + MapData.diffName(def.diff) + "]  +" + coins + " coins", "green");
 		cmd("playsound minecraft:entity.experience_orb.pickup master " + p.name);
+		hudDirty = true;
 		updateBar();
 		checkWin();
+	}
+
+	static void enterCode(ServerPlayer sp, int code) {
+		Tasks.code(sp, code);
 	}
 
 	static void showTasks(ServerPlayer sp) {
@@ -732,15 +975,19 @@ public final class Game {
 			tell(n, "No game running.", "gray");
 			return;
 		}
-		if (p.role.impostor) {
-			tell(n, "Impostors have no real tasks. Fake some tasks to blend in! Task stations are lecterns.", "red");
-			return;
-		}
-		tell(n, "Your tasks:", "gold");
+		tell(n, p.role.impostor ? "Your FAKE tasks (blend in!):" : "Your tasks:", p.role.impostor ? "red" : "gold");
 		for (TaskRef t : p.tasks) {
 			MapData.TaskDef d = map.tasks.get(t.idx);
-			tell(n, (t.done ? "[done] " : "[todo] ") + d.name + " (" + d.pos.x + ", " + d.pos.y + ", " + d.pos.z + ")",
-				t.done ? "green" : "yellow");
+			String where;
+			if (t.done) {
+				where = "done";
+			} else {
+				MapData.Step s = d.steps.get(Math.min(t.step, d.steps.size() - 1));
+				where = s.room + " (" + s.pos.x + ", " + s.pos.y + ", " + s.pos.z + ")"
+					+ (d.steps.size() > 1 ? " step " + (t.step + 1) + "/" + d.steps.size() : "");
+			}
+			tell(n, (t.done ? "[done] " : "[todo] ") + d.name + " [" + MapData.diffName(d.diff) + "] - " + where,
+				t.done ? "dark_gray" : MapData.diffColor(d.diff));
 		}
 	}
 
@@ -788,22 +1035,21 @@ public final class Game {
 		double z = victimPlayer.getZ();
 		victim.alive = false;
 		victim.run = null;
+		if (victim.ventLeft > 0) victim.ventLeft = 0;
 		killer.killCd = killCd * 20;
+		Stats.S ks = Stats.get(killer.id);
+		ks.kills++;
+		ks.coins += 25;
+		Stats.save();
 
-		bodies.add(new Body(victim.color, x, y, z));
-		int rgb = AmongColor.RGB[victim.color];
-		String piece = ",count:1,components:{\"minecraft:dyed_color\":" + rgb + "}}";
-		cmd("summon minecraft:armor_stand " + f(x) + " " + f(y) + " " + f(z)
-			+ " {Tags:[\"amongus_body\"],ShowArms:1b,NoBasePlate:1b,"
-			+ "Pose:{Head:[25f,0f,0f],Body:[10f,0f,0f],LeftArm:[-20f,0f,-10f],RightArm:[-20f,0f,10f],LeftLeg:[0f,0f,-5f],RightLeg:[0f,0f,5f]},"
-			+ "equipment:{head:{id:\"minecraft:leather_helmet\"" + piece
-			+ ",chest:{id:\"minecraft:leather_chestplate\"" + piece
-			+ ",legs:{id:\"minecraft:leather_leggings\"" + piece
-			+ ",feet:{id:\"minecraft:leather_boots\"" + piece + "}}");
+		double fy = map.lobby != null ? map.lobby.y : y;
+		bodies.add(new Body(victim.color, x, fy, z));
+		spawnBody(victim.color, x, fy, z);
 
 		cmd("gamemode spectator " + victim.name);
 		title(victim.name, "YOU DIED", "You were killed. You are a ghost now.", "red");
 		tp(killer.name, x, y, z);
+		hudDirty = true;
 		updateBar();
 		checkWin();
 	}
@@ -813,27 +1059,43 @@ public final class Game {
 			return InteractionResult.PASS;
 		}
 		PState p = players.get(sp.getUUID());
-		if (p == null || phase != Phase.PLAYING || !p.alive) return InteractionResult.PASS;
+		if (p == null) return InteractionResult.PASS;
 		BlockPos pos = hit.getBlockPos();
+
+		// electrical levers: never toggled by vanilla, only by our lights puzzle
+		for (int k = 0; k < map.switches.size(); k++) {
+			if (map.switches.get(k).is(pos)) {
+				if (phase == Phase.PLAYING && p.alive) leverClick(p, k);
+				return InteractionResult.SUCCESS;
+			}
+		}
+		if (phase != Phase.PLAYING || !p.alive) return InteractionResult.PASS;
+
 		if (map.button != null && map.button.is(pos)) {
 			emergency(p);
 			return InteractionResult.PASS;
 		}
-		if (map.lights != null && map.lights.is(pos)) {
-			fixLights(p);
+		if (map.o2Code != null && map.o2Code.is(pos)) {
+			o2CodeClick(p);
 			return InteractionResult.SUCCESS;
 		}
-		if (map.reactor != null && map.reactor.is(pos)) {
-			fixReactor(p);
+		if (map.o2Panel != null && map.o2Panel.is(pos)) {
+			o2PanelClick(p);
 			return InteractionResult.SUCCESS;
+		}
+		for (int k = 0; k < map.reactors.size(); k++) {
+			if (map.reactors.get(k).is(pos)) {
+				reactorClick(p, map.reactors.size() == 1);
+				return InteractionResult.SUCCESS;
+			}
 		}
 		for (int i = 0; i < map.vents.size(); i++) {
-			if (map.vents.get(i).is(pos)) {
+			if (map.vents.get(i).pos.is(pos)) {
 				ventUse(p, sp, i);
 				return InteractionResult.SUCCESS;
 			}
 		}
-		if (taskClick(p, pos)) return InteractionResult.SUCCESS;
+		if (Tasks.click(p, sp, pos)) return InteractionResult.SUCCESS;
 		return InteractionResult.PASS;
 	}
 
@@ -880,7 +1142,7 @@ public final class Game {
 	}
 
 	// =====================================================================
-	// vents / sabotage / abilities
+	// vents
 	// =====================================================================
 
 	static void ventUse(PState p, ServerPlayer sp, int i) {
@@ -898,12 +1160,21 @@ public final class Game {
 			p.ventLeft = ventDuration * 20; // start the vent session
 			tell(p.name, "You entered the vents. You have " + ventDuration + " seconds - click vents to hop.", "gray");
 		}
-		int n = map.vents.size();
-		int next = sp.isShiftKeyDown() ? (i - 1 + n) % n : (i + 1) % n;
-		MapData.P dest = map.vents.get(next);
+		// travel only inside the vent's own group
+		int group = map.vents.get(i).group;
+		List<Integer> members = new ArrayList<>();
+		for (int k = 0; k < map.vents.size(); k++) if (map.vents.get(k).group == group) members.add(k);
+		if (members.size() < 2) {
+			bar(p.name, "This vent is not connected to anything.", "gray");
+			return;
+		}
+		int at = members.indexOf(i);
+		int n = members.size();
+		int next = members.get(sp.isShiftKeyDown() ? (at - 1 + n) % n : (at + 1) % n);
+		MapData.P dest = map.vents.get(next).pos;
 		p.hopCd = 20;
 		tp(p.name, dest.cx(), dest.y + 0.1, dest.cz());
-		if (imp) bar(p.name, "Vent " + (next + 1) + "/" + n + " (click = next, sneak+click = previous)", "gray");
+		if (imp) bar(p.name, "Vent (click = next, sneak+click = previous)", "gray");
 	}
 
 	/** Engineer leaves the vents (time ran out or a meeting started): cooldown begins. */
@@ -911,6 +1182,16 @@ public final class Game {
 		p.ventLeft = 0;
 		p.ventCd = ventCooldown * 20;
 		bar(p.name, "You left the vents. Vent cooldown: " + ventCooldown + "s", "gray");
+	}
+
+	// =====================================================================
+	// sabotage: lights (switches), O2 (code), reactor (two panels)
+	// =====================================================================
+
+	static void sabotageMenu(ServerPlayer sp) {
+		String n = sp.getName().getString();
+		raw(n, "[" + btn("LIGHTS", "yellow", "/among sabotage lights") + "," + btn("O2", "aqua", "/among sabotage o2") + ","
+			+ btn("REACTOR", "red", "/among sabotage reactor") + "]");
 	}
 
 	static void sabotage(ServerPlayer sp, String kind) {
@@ -924,54 +1205,195 @@ public final class Game {
 			tell(n, "Sabotage cooldown: " + (p.sabCd / 20 + 1) + "s", "red");
 			return;
 		}
-		if (lightsOut || reactorTicks > 0) {
+		if (lightsOut || sabotageActive()) {
 			tell(n, "A sabotage is already active.", "red");
 			return;
 		}
-		if ("lights".equals(kind)) {
-			if (map.lights == null) {
-				tell(n, "This map has no lights panel.", "red");
-				return;
+		switch (kind) {
+			case "lights" -> {
+				if (map.switches.isEmpty()) {
+					tell(n, "This map has no electrical switches.", "red");
+					return;
+				}
+				lightsOut = true;
+				int cnt = map.switches.size();
+				lightsState = new boolean[cnt];
+				boolean allOn = true;
+				for (int k = 0; k < cnt; k++) {
+					lightsState[k] = RNG.nextBoolean();
+					if (!lightsState[k]) allOn = false;
+				}
+				if (allOn) lightsState[RNG.nextInt(cnt)] = false;
+				for (int k = 0; k < cnt; k++) setLever(k, lightsState[k]);
+				for (PState c : players.values()) {
+					if (!c.role.impostor) {
+						if (c.alive) cmd("effect give " + c.name + " minecraft:blindness infinite 0 true");
+						title(c.name, "LIGHTS OUT", "Flip ALL switches ON in Electrical!", "red");
+					}
+				}
 			}
-			lightsOut = true;
-			for (PState c : alive()) {
-				if (!c.role.impostor) cmd("effect give " + c.name + " minecraft:blindness infinite 0 true");
+			case "o2" -> {
+				if (map.o2Panel == null) {
+					tell(n, "This map has no O2 panel.", "red");
+					return;
+				}
+				o2Ticks = 45 * 20;
+				o2CodeVal = 10000 + RNG.nextInt(90000);
+				for (PState c : players.values()) {
+					if (!c.role.impostor) title(c.name, "O2 DEPLETED", "Read the code at the Admin panel, enter it in O2!", "red");
+				}
 			}
-			for (PState c : players.values()) {
-				if (!c.role.impostor) title(c.name, "LIGHTS OUT", "Fix them at the Electrical panel", "red");
-			}
-		} else {
-			if (map.reactor == null) {
-				tell(n, "This map has no reactor panel.", "red");
-				return;
-			}
-			reactorTicks = 45 * 20;
-			for (PState c : players.values()) {
-				if (!c.role.impostor) title(c.name, "REACTOR MELTDOWN", "Click the panel in the Reactor room!", "red");
+			default -> {
+				if (map.reactors.isEmpty()) {
+					tell(n, "This map has no reactor panels.", "red");
+					return;
+				}
+				reactorTicks = 45 * 20;
+				reactorHold = 0;
+				for (PState c : players.values()) {
+					if (!c.role.impostor) title(c.name, "REACTOR MELTDOWN", "Two players: HOLD SNEAK at both Reactor panels!", "red");
+				}
 			}
 		}
 		p.sabCd = 30 * 20;
 	}
 
-	static void fixLights(PState p) {
+	static void sabotageTick() {
+		if (o2Ticks > 0) {
+			o2Ticks--;
+			if (tickN % 10 == 0) {
+				for (PState p : alive()) {
+					if (!p.role.impostor) bar(p.name, "O2 DEPLETED in " + (o2Ticks / 20) + "s! Code is at Admin, enter it at the O2 keypad: /among o2 <code>", "red");
+				}
+			}
+			if (o2Ticks == 0) {
+				if (!testMode) endGame(false, "Everyone suffocated - O2 was not restored!");
+				else tellAll("O2 ran out (test mode, game continues).", "red");
+				return;
+			}
+		}
+		if (reactorTicks > 0) {
+			reactorTicks--;
+			if (map.reactors.size() >= 2) {
+				PState occ0 = null;
+				PState occ1 = null;
+				for (PState c : alive()) {
+					if (c.role.impostor) continue;
+					ServerPlayer s = find(c.id);
+					if (s == null || !s.isShiftKeyDown()) continue;
+					if (occ0 == null && dist2(s, map.reactors.get(0)) <= 9.0) occ0 = c;
+					else if (occ1 == null && dist2(s, map.reactors.get(1)) <= 9.0) occ1 = c;
+				}
+				if (occ0 != null && occ1 != null && occ0 != occ1) {
+					reactorHold++;
+					if (reactorHold % 10 == 0) {
+						bar(occ0.name, "Hold! " + (reactorHold * 100 / 60) + "%", "green");
+						bar(occ1.name, "Hold! " + (reactorHold * 100 / 60) + "%", "green");
+					}
+					if (reactorHold >= 60) {
+						reactorTicks = 0;
+						reactorHold = 0;
+						tellAll("Reactor stabilised by " + label(occ0) + " and " + label(occ1) + ".", "green");
+						return;
+					}
+				} else {
+					reactorHold = 0;
+				}
+			}
+			if (tickN % 10 == 0) {
+				for (PState p : alive()) {
+					if (!p.role.impostor) bar(p.name, "REACTOR MELTDOWN in " + (reactorTicks / 20) + "s! Two players HOLD SNEAK at both Reactor panels", "red");
+				}
+			}
+			if (reactorTicks == 0) {
+				if (!testMode) endGame(false, "The reactor melted down!");
+				else tellAll("Reactor meltdown (test mode, game continues).", "red");
+			}
+		}
+	}
+
+	static void setLever(int k, boolean on) {
+		MapData.P q = map.switches.get(k);
+		cmd("setblock " + q.x + " " + q.y + " " + q.z + " minecraft:lever[face=floor,facing=north,powered=" + on + "]");
+	}
+
+	static void leverClick(PState p, int k) {
 		if (!lightsOut) {
-			bar(p.name, "The lights are fine.", "gray");
+			bar(p.name, "The lights are fine - nothing to fix.", "gray");
 			return;
 		}
 		if (p.role.impostor) {
 			bar(p.name, "Impostors can't fix sabotage.", "red");
 			return;
 		}
-		lightsOut = false;
-		clearBlind();
-		tellAll("Lights fixed by " + label(p) + ".", "green");
+		if (k >= lightsState.length) return;
+		lightsState[k] = !lightsState[k];
+		setLever(k, lightsState[k]);
+		int on = 0;
+		for (boolean b : lightsState) if (b) on++;
+		bar(p.name, "Switches ON: " + on + "/" + lightsState.length, "yellow");
+		if (on == lightsState.length) {
+			lightsOut = false;
+			clearBlind();
+			tellAll("The lights are back! Fixed by " + label(p) + ".", "green");
+		}
 	}
 
 	static void clearBlind() {
 		for (PState c : players.values()) cmd("effect clear " + c.name + " minecraft:blindness");
 	}
 
-	static void fixReactor(PState p) {
+	static void o2CodeClick(PState p) {
+		if (o2Ticks <= 0) {
+			bar(p.name, "The O2 system is fine.", "gray");
+			return;
+		}
+		if (p.role.impostor) {
+			bar(p.name, "Impostors can't fix sabotage.", "red");
+			return;
+		}
+		title(p.name, "O2 CODE: " + o2CodeVal, "Go to O2 and type /among o2 " + o2CodeVal, "aqua");
+		tell(p.name, "O2 code: " + o2CodeVal + "  -> go to the O2 keypad and type /among o2 " + o2CodeVal, "aqua");
+	}
+
+	static void o2PanelClick(PState p) {
+		if (o2Ticks <= 0) {
+			bar(p.name, "The O2 system is fine.", "gray");
+			return;
+		}
+		if (p.role.impostor) {
+			bar(p.name, "Impostors can't fix sabotage.", "red");
+			return;
+		}
+		tell(p.name, "O2 keypad: type /among o2 <code>. The code is shown on the Admin panel.", "aqua");
+		if (o2Easy) tell(p.name, "(easy mode) The code is " + o2CodeVal, "aqua");
+	}
+
+	static void o2Enter(ServerPlayer sp, int code) {
+		PState p = players.get(sp.getUUID());
+		String n = sp.getName().getString();
+		if (p == null || phase != Phase.PLAYING || !p.alive) return;
+		if (o2Ticks <= 0) {
+			tell(n, "The O2 system is fine.", "gray");
+			return;
+		}
+		if (p.role.impostor) {
+			tell(n, "Impostors can't fix sabotage.", "red");
+			return;
+		}
+		if (map.o2Panel != null && dist2(sp, map.o2Panel) > 64.0) {
+			tell(n, "You must be next to the O2 keypad to enter the code.", "red");
+			return;
+		}
+		if (code != o2CodeVal) {
+			tell(n, "Wrong code!", "red");
+			return;
+		}
+		o2Ticks = 0;
+		tellAll("O2 restored by " + label(p) + ".", "green");
+	}
+
+	static void reactorClick(PState p, boolean single) {
 		if (reactorTicks <= 0) {
 			bar(p.name, "The reactor is stable.", "gray");
 			return;
@@ -980,9 +1402,17 @@ public final class Game {
 			bar(p.name, "Impostors can't fix sabotage.", "red");
 			return;
 		}
-		reactorTicks = 0;
-		tellAll("Reactor stabilised by " + label(p) + ".", "green");
+		if (single) {
+			reactorTicks = 0;
+			tellAll("Reactor stabilised by " + label(p) + ".", "green");
+		} else {
+			bar(p.name, "Two players must HOLD SNEAK next to the two panels at the same time.", "yellow");
+		}
 	}
+
+	// =====================================================================
+	// abilities
+	// =====================================================================
 
 	static void shift(ServerPlayer sp, String colorName) {
 		PState p = players.get(sp.getUUID());
@@ -1057,13 +1487,102 @@ public final class Game {
 	// meetings and voting
 	// =====================================================================
 
-	static void emergency(PState p) {
-		if (buttonLeft > 0) {
-			bar(p.name, "The emergency button is recharging: " + (buttonLeft / 20 + 1) + "s", "red");
+
+	// =====================================================================
+	// Dialog screens (vanilla 1.21.6+ server-sent GUI)
+	// =====================================================================
+
+	/** A component in SNBT form. */
+	static String sc(String s, String color) {
+		return "{text:\"" + esc(s) + "\",color:\"" + color + "\"}";
+	}
+
+	/** Open a dialog. buttons = {label, color, command}; empty/null = a simple notice with an OK button. */
+	static void showDialog(String name, String titleSn, List<String> bodySn, List<String[]> buttons) {
+		StringBuilder sb = new StringBuilder();
+		boolean multi = buttons != null && !buttons.isEmpty();
+		sb.append("{type:\"minecraft:").append(multi ? "multi_action" : "notice").append("\",title:").append(titleSn)
+			.append(",pause:false,body:[");
+		for (int i = 0; i < bodySn.size(); i++) {
+			if (i > 0) sb.append(",");
+			sb.append("{type:\"minecraft:plain_message\",contents:").append(bodySn.get(i)).append(",width:320}");
+		}
+		sb.append("]");
+		if (multi) {
+			sb.append(",columns:2,actions:[");
+			for (int i = 0; i < buttons.size(); i++) {
+				String[] b = buttons.get(i);
+				if (i > 0) sb.append(",");
+				sb.append("{label:").append(sc(b[0], b[1])).append(",width:150,action:{type:\"minecraft:run_command\",command:\"")
+					.append(esc(b[2])).append("\"}}");
+			}
+			sb.append("],exit_action:{label:{text:\"Close\"},width:150}");
+		}
+		sb.append("}");
+		cmd("dialog show " + name + " " + sb);
+	}
+
+	/** One line of the player list: coloured dot, colour, name, alive/dead. */
+	private static String playerLine(PState o) {
+		String c = o.color >= 0 ? AmongColor.label(o.color) : "?";
+		String hex = o.color >= 0 ? AmongColor.hex(o.color) : "white";
+		if (o.alive) return "[" + sc("\u25cf " + c, hex) + "," + sc(" - " + o.name + "  ", "white") + "," + sc("ALIVE", "green") + "]";
+		return "[" + sc("\u2716 " + c, "gray") + "," + sc(" - " + o.name + "  ", "gray") + "," + sc("DEAD", "red") + "]";
+	}
+
+	static void meetingScreen(PState caller, int bodyColor) {
+		List<String> body = new ArrayList<>();
+		body.add(sc("Called by: " + label(caller) + " (" + caller.name + ")", "yellow"));
+		if (bodyColor >= 0) {
+			PState dead = byColor(bodyColor);
+			body.add(sc("Body found: " + AmongColor.label(bodyColor) + (dead != null ? " (" + dead.name + ")" : ""), "red"));
+		} else {
+			body.add(sc("Emergency button pressed!", "red"));
+		}
+		body.add(sc("Discuss in chat. Voting starts in " + discuss + " seconds.", "gray"));
+		body.add(sc("--- Crew ---", "gold"));
+		for (PState o : players.values()) body.add(playerLine(o));
+		String title = bodyColor >= 0 ? "BODY REPORTED" : "EMERGENCY MEETING";
+		for (PState p : players.values()) showDialog(p.name, sc(title, "red"), body, null);
+	}
+
+	static void voteScreen(PState p) {
+		List<String> body = new ArrayList<>();
+		body.add(sc("Who is the Impostor? Click a player, or type /among vote <color>.", "gray"));
+		body.add(sc("You have " + voteTime + " seconds.", "yellow"));
+		List<String[]> buttons = new ArrayList<>();
+		for (PState o : alive()) {
+			buttons.add(new String[] {AmongColor.label(o.color) + " - " + o.name, AmongColor.hex(o.color), "/among vote " + AmongColor.NAMES[o.color]});
+		}
+		buttons.add(new String[] {"SKIP VOTE", "gray", "/among vote skip"});
+		showDialog(p.name, sc("VOTE", "gold"), body, buttons);
+	}
+
+	static void reopenVote(ServerPlayer sp) {
+		PState p = players.get(sp.getUUID());
+		if (p == null || phase != Phase.VOTE || !p.alive) {
+			tell(sp.getName().getString(), "No vote is running. Use /among vote <color> during voting.", "red");
 			return;
 		}
-		if (reactorTicks > 0) {
-			bar(p.name, "You can't call a meeting during a reactor meltdown!", "red");
+		voteScreen(p);
+	}
+
+	static void ejectScreen(List<String> lines, String headline, String sub, String color) {
+		List<String> body = new ArrayList<>();
+		body.add(sc(headline, color));
+		body.add(sc(sub, "white"));
+		body.add(sc("--- Votes ---", "gold"));
+		for (String l : lines) body.add(sc(l, "gray"));
+		for (PState p : players.values()) showDialog(p.name, sc("EJECTION", color), body, null);
+	}
+
+	static void emergency(PState p) {
+		if (sabotageActive()) {
+			bar(p.name, "You can't call a meeting during a sabotage!", "red");
+			return;
+		}
+		if (buttonLeft > 0) {
+			bar(p.name, "The emergency button is recharging: " + (buttonLeft / 20 + 1) + "s", "red");
 			return;
 		}
 		if (p.meetingsLeft <= 0) {
@@ -1079,9 +1598,12 @@ public final class Game {
 		phaseTicks = discuss * 20;
 		lightsOut = false;
 		reactorTicks = 0;
+		reactorHold = 0;
+		o2Ticks = 0;
 		clearBlind();
+		for (int k = 0; k < map.switches.size(); k++) setLever(k, true);
 		bodies.clear();
-		cmd("kill @e[type=minecraft:armor_stand,tag=amongus_body]");
+		clearBodies();
 		for (PState p : players.values()) {
 			p.run = null;
 			p.votedFor = -2;
@@ -1099,6 +1621,8 @@ public final class Game {
 			title(p.name, head, sub, "red");
 			tell(p.name, head + ": " + sub + ". Discuss in chat! Voting starts in " + discuss + "s.", "gold");
 		}
+		meetingScreen(caller, bodyColor);
+		hudDirty = true;
 	}
 
 	static void beginVoting() {
@@ -1111,7 +1635,10 @@ public final class Game {
 		sb.append(btn("SKIP", "gray", "/among vote skip")).append("]");
 		for (PState p : players.values()) {
 			tell(p.name, "=== VOTE === click a color (or SKIP). Type /among vote <color> if clicking doesn't work.", "gold");
-			if (p.alive) raw(p.name, sb.toString());
+			if (p.alive) {
+				raw(p.name, sb.toString());
+				voteScreen(p);
+			}
 		}
 	}
 
@@ -1151,12 +1678,15 @@ public final class Game {
 			else counts[p.votedFor]++;
 		}
 		StringBuilder res = new StringBuilder("Votes: ");
+		List<String> lines = new ArrayList<>();
 		int best = -1;
 		int bestN = 0;
 		boolean tie = false;
 		for (int i = 0; i < counts.length; i++) {
 			if (counts[i] == 0) continue;
+			PState vp = byColor(i);
 			res.append(AmongColor.label(i)).append("=").append(counts[i]).append(" ");
+			lines.add(AmongColor.label(i) + (vp != null ? " (" + vp.name + ")" : "") + ": " + counts[i] + " vote(s)");
 			if (counts[i] > bestN) {
 				best = i;
 				bestN = counts[i];
@@ -1166,18 +1696,27 @@ public final class Game {
 			}
 		}
 		res.append("Skip=").append(skips);
+		lines.add("Skipped: " + skips);
 		tellAll(res.toString(), "yellow");
 
 		if (best < 0 || tie || skips >= bestN) {
 			tellAll("Nobody was ejected.", "gray");
+			ejectScreen(lines, "No one was ejected.", tie ? "The vote was a tie." : "The crew skipped.", "gray");
+			for (PState p : players.values()) title(p.name, "NO ONE EJECTED", tie ? "Tie vote" : "Skipped", "gray");
 		} else {
 			PState e = byColor(best);
 			if (e != null) {
 				e.alive = false;
 				cmd("gamemode spectator " + e.name);
 				cmd("effect clear " + e.name + " minecraft:slowness");
-				tellAll(AmongColor.label(best) + " was ejected. " + AmongColor.label(best) + " was "
-					+ (e.role.impostor ? "An Impostor." : "not An Impostor."), e.role.impostor ? "green" : "red");
+				String who = AmongColor.label(best) + " (" + e.name + ")";
+				String verdict = who + (e.role.impostor ? " was An Impostor." : " was not An Impostor.");
+				tellAll(verdict, e.role.impostor ? "green" : "red");
+				ejectScreen(lines, verdict, e.role.impostor ? "Good job, crew!" : "An innocent crewmate was ejected...",
+					e.role.impostor ? "green" : "red");
+				for (PState p : players.values()) {
+					title(p.name, AmongColor.label(best) + (e.role.impostor ? " WAS AN IMPOSTOR" : " WAS NOT AN IMPOSTOR"), e.name, e.role.impostor ? "green" : "red");
+				}
 			}
 		}
 		endMeeting();
@@ -1191,6 +1730,7 @@ public final class Game {
 			p.killCd = Math.max(p.killCd, killCd * 20);
 		}
 		gather(5.0);
+		hudDirty = true;
 		updateBar();
 		checkWin();
 	}
@@ -1242,10 +1782,25 @@ public final class Game {
 				if (p.color < 0) continue;
 				tellAll(AmongColor.label(p.color) + " = " + p.name + " (" + p.role.display + ")", p.role.color);
 			}
+			for (PState p : players.values()) {
+				if (p.color < 0) continue;
+				Stats.S st = Stats.get(p.id);
+				st.games++;
+				st.coins += 10;
+				boolean won = crewWin ? !p.role.impostor : p.role.impostor;
+				if (won) {
+					st.wins++;
+					st.coins += 100;
+					tell(p.name, "You won! +100 coins (+10 for playing)", "gold");
+				} else {
+					tell(p.name, "+10 coins for playing", "gray");
+				}
+			}
+			Stats.save();
 		}
 		for (PState p : players.values()) {
 			cleanupPlayer(p.name, true);
-			cmd("tag " + p.name + " add amongus_in");
+			Hud.hideNames(p, false);
 			if (map.lobby != null) tp(p.name, map.lobby.cx(), map.lobby.y, map.lobby.cz());
 			p.alive = true;
 			p.color = -1;
@@ -1253,7 +1808,9 @@ public final class Game {
 			p.tasks.clear();
 			p.run = null;
 		}
+		for (int k = 0; k < map.switches.size(); k++) setLever(k, true);
 		resetWorldState();
+		Hud.refreshAll(true);
 		tellAll("Back in the lobby. Host: /among start for another round.", "yellow");
 	}
 }
