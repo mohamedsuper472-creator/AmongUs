@@ -23,14 +23,17 @@ public final class AmongCommands {
 	private static final SuggestionProvider<CommandSourceStack> COLORS =
 		(ctx, b) -> SharedSuggestionProvider.suggest(AmongColor.names(), b);
 	private static final SuggestionProvider<CommandSourceStack> VOTES =
-		(ctx, b) -> SharedSuggestionProvider.suggest(
-			Arrays.asList("skip", "red", "blue", "green", "pink", "orange", "yellow", "black", "white", "purple", "brown", "cyan", "lime"), b);
+		(ctx, b) -> {
+	java.util.List<String> l = new java.util.ArrayList<>(AmongColor.names());
+	l.add("skip");
+	return SharedSuggestionProvider.suggest(l, b);
+};
 	private static final SuggestionProvider<CommandSourceStack> KEYS =
 		(ctx, b) -> SharedSuggestionProvider.suggest(
-			Arrays.asList("impostors", "shapeshifters", "engineers", "scientists", "tasks", "killcd", "discuss",
-				"vote", "meetings", "shiftduration", "ventduration", "ventcooldown", "buttoncd", "redsword"), b);
+			Arrays.asList("impostors", "crewmates", "shapeshifters", "engineers", "scientists", "easytasks", "mediumtasks", "hardtasks", "tasktime", "killcd", "discuss",
+				"vote", "meetings", "shiftduration", "ventduration", "ventcooldown", "buttoncd", "o2easy", "redsword"), b);
 	private static final SuggestionProvider<CommandSourceStack> TYPES =
-		(ctx, b) -> SharedSuggestionProvider.suggest(Arrays.asList("click", "hold", "code"), b);
+		(ctx, b) -> SharedSuggestionProvider.suggest(Arrays.asList("clicks", "hold", "sneak", "code", "swipe", "bar"), b);
 
 	private static ServerPlayer pl(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
 		Game.server = c.getSource().getServer();
@@ -62,10 +65,57 @@ public final class AmongCommands {
 				Game.status(pl(c));
 				return 1;
 			}))
-			.then(Commands.literal("join").executes(c -> {
-				Game.join(pl(c));
-				return 1;
-			}))
+			.then(Commands.literal("join")
+.executes(c -> {
+	Game.join(pl(c), null, null);
+	return 1;
+})
+.then(Commands.argument("game", StringArgumentType.word()).executes(c -> {
+	Game.join(pl(c), StringArgumentType.getString(c, "game"), null);
+	return 1;
+})
+	.then(Commands.argument("code", StringArgumentType.word()).executes(c -> {
+		Game.join(pl(c), StringArgumentType.getString(c, "game"), StringArgumentType.getString(c, "code"));
+		return 1;
+	}))))
+.then(Commands.literal("create")
+.executes(c -> {
+	Game.create(pl(c), null);
+	return 1;
+})
+.then(Commands.argument("name", StringArgumentType.word()).executes(c -> {
+	Game.create(pl(c), StringArgumentType.getString(c, "name"));
+	return 1;
+})))
+.then(Commands.literal("rename")
+.then(Commands.argument("name", StringArgumentType.word()).executes(c -> {
+	Game.rename(pl(c), StringArgumentType.getString(c, "name"));
+	return 1;
+})))
+.then(Commands.literal("public").executes(c -> {
+	Game.setPublic(pl(c));
+	return 1;
+}))
+.then(Commands.literal("private")
+.executes(c -> {
+	Game.setPrivate(pl(c), null);
+	return 1;
+})
+.then(Commands.argument("code", StringArgumentType.word()).executes(c -> {
+	Game.setPrivate(pl(c), StringArgumentType.getString(c, "code"));
+	return 1;
+})))
+.then(Commands.literal("games").executes(c -> {
+	Game.games(pl(c));
+	return 1;
+}))
+.then(Commands.literal("minimap")
+.then(Commands.argument("mode", StringArgumentType.word())
+	.suggests((ctx, b) -> SharedSuggestionProvider.suggest(Arrays.asList("right", "top", "off"), b))
+	.executes(c -> {
+		Game.minimap(pl(c), StringArgumentType.getString(c, "mode").toLowerCase());
+		return 1;
+	})))
 			.then(Commands.literal("leave").executes(c -> {
 				ServerPlayer p = pl(c);
 				Game.leave(p.getUUID(), false);
@@ -97,22 +147,48 @@ public final class AmongCommands {
 				return 1;
 			}))
 			.then(Commands.literal("code")
-				.then(Commands.argument("code", IntegerArgumentType.integer(0, 9999)).executes(c -> {
+				.then(Commands.argument("code", IntegerArgumentType.integer(0, 99999)).executes(c -> {
 					Game.enterCode(pl(c), IntegerArgumentType.getInteger(c, "code"));
 					return 1;
 				})))
 			.then(Commands.literal("vote")
-				.then(Commands.argument("target", StringArgumentType.word()).suggests(VOTES).executes(c -> {
+.executes(c -> {
+	Game.reopenVote(pl(c));
+	return 1;
+})
+.then(Commands.argument("target", StringArgumentType.word()).suggests(VOTES).executes(c -> {
 					Game.vote(pl(c), StringArgumentType.getString(c, "target"));
 					return 1;
 				})))
 			.then(Commands.literal("sabotage")
+				.executes(c -> {
+					Game.sabotageMenu(pl(c));
+					return 1;
+				})
 				.then(Commands.literal("lights").executes(c -> {
 					Game.sabotage(pl(c), "lights");
 					return 1;
 				}))
+				.then(Commands.literal("o2").executes(c -> {
+					Game.sabotage(pl(c), "o2");
+					return 1;
+				}))
 				.then(Commands.literal("reactor").executes(c -> {
 					Game.sabotage(pl(c), "reactor");
+					return 1;
+				})))
+			.then(Commands.literal("stats").executes(c -> {
+				Game.stats(pl(c));
+				return 1;
+			}))
+			.then(Commands.literal("pick")
+				.then(Commands.argument("n", IntegerArgumentType.integer(0, 99)).executes(c -> {
+					Tasks.pick(pl(c), IntegerArgumentType.getInteger(c, "n"));
+					return 1;
+				})))
+			.then(Commands.literal("o2")
+				.then(Commands.argument("code", IntegerArgumentType.integer(0, 99999)).executes(c -> {
+					Game.o2Enter(pl(c), IntegerArgumentType.getInteger(c, "code"));
 					return 1;
 				})))
 			.then(Commands.literal("shift")
@@ -141,16 +217,23 @@ public final class AmongCommands {
 						return 0;
 					}
 					BlockPos pos = p.blockPosition();
-					Game.tell(n, "Building the map around you (70x70 blocks, overworld)... stay still.", "yellow");
-					Game.map = MapBuilder.build(pos.getX(), pos.getY(), pos.getZ());
-					Game.tell(n, "Map built! Everyone can now /among join. (Lobby = Cafeteria, red button = emergency meeting, iron trapdoors = vents)", "green");
+					if (!Game.work.isEmpty()) {
+						Game.tell(n, "A build is already running.", "red");
+						return 0;
+					}
+					Game.tell(n, "Building the BIG Skeld map around you (about 250x120 blocks). It takes a few minutes. Stay in the area and do not stop the server!", "yellow");
+					Game.tell(n, "Stand on flat ground with lots of free space. The Cafeteria is built where you stand.", "yellow");
+					MapBuilder.build(pos.getX(), pos.getY(), pos.getZ(), m -> {
+						Game.map = m;
+						Game.tell(n, "Map built! Everyone can now /among join. (Cafeteria = lobby, red button = emergency, iron trapdoors = vents)", "green");
+					});
 					return 1;
 				}))
 				.then(Commands.literal("info").executes(c -> {
 					ServerPlayer p = pl(c);
 					Game.tell(p.getName().getString(), "Map ready=" + Game.map.ready() + " tasks=" + Game.map.tasks.size()
-						+ " vents=" + Game.map.vents.size() + " lights=" + (Game.map.lights != null)
-						+ " reactor=" + (Game.map.reactor != null), "yellow");
+						+ " vents=" + Game.map.vents.size() + " switches=" + Game.map.switches.size()
+						+ " reactors=" + Game.map.reactors.size() + " o2=" + (Game.map.o2Panel != null), "yellow");
 					return 1;
 				}))
 				.then(Commands.literal("clear").executes(c -> {
@@ -168,27 +251,40 @@ public final class AmongCommands {
 						Game.tell(p.getName().getString(), "Look at a block first (within 6 blocks).", "red");
 						return 0;
 					}
-					Game.map.vents.add(new MapData.P(b.getX(), b.getY(), b.getZ()));
+					MapData.Vent nv = new MapData.Vent();
+					nv.pos = new MapData.P(b.getX(), b.getY(), b.getZ());
+					nv.group = 0;
+					Game.map.vents.add(nv);
 					Game.map.save();
 					Game.tell(p.getName().getString(), "Vent #" + Game.map.vents.size() + " added.", "green");
 					return 1;
 				}))
 				.then(Commands.literal("addtask")
 					.then(Commands.argument("type", StringArgumentType.word()).suggests(TYPES)
-						.then(Commands.argument("name", StringArgumentType.greedyString()).executes(c -> {
-							ServerPlayer p = pl(c);
-							String type = StringArgumentType.getString(c, "type").toLowerCase();
-							BlockPos b = lookedAt(p);
-							if (b == null || !(type.equals("click") || type.equals("hold") || type.equals("code"))) {
-								Game.tell(p.getName().getString(), "Look at a block, and use type click, hold or code.", "red");
-								return 0;
-							}
-							Game.map.tasks.add(new MapData.TaskDef(StringArgumentType.getString(c, "name"), type,
-								new MapData.P(b.getX(), b.getY(), b.getZ())));
-							Game.map.save();
-							Game.tell(p.getName().getString(), "Task added (" + Game.map.tasks.size() + " total).", "green");
-							return 1;
-						}))))
+						.then(Commands.argument("diff", IntegerArgumentType.integer(1, 3))
+							.then(Commands.argument("name", StringArgumentType.greedyString()).executes(c -> {
+								ServerPlayer p = pl(c);
+								String type = StringArgumentType.getString(c, "type").toLowerCase();
+								BlockPos b = lookedAt(p);
+								if (b == null) {
+									Game.tell(p.getName().getString(), "Look at a block first (within 6 blocks).", "red");
+									return 0;
+								}
+								MapData.TaskDef td = new MapData.TaskDef();
+								td.name = StringArgumentType.getString(c, "name");
+								td.diff = IntegerArgumentType.getInteger(c, "diff");
+								MapData.Step st = new MapData.Step();
+								st.mech = type;
+								st.a = 3;
+								st.b = 0;
+								st.room = "Custom";
+								st.pos = new MapData.P(b.getX(), b.getY(), b.getZ());
+								td.steps.add(st);
+								Game.map.tasks.add(td);
+								Game.map.save();
+								Game.tell(p.getName().getString(), "Task added (" + Game.map.tasks.size() + " total).", "green");
+								return 1;
+							})))))
 				.then(Commands.literal("set")
 					.then(Commands.literal("lobby").executes(c -> {
 						ServerPlayer p = pl(c);
@@ -198,11 +294,25 @@ public final class AmongCommands {
 						Game.tell(p.getName().getString(), "Lobby set to where you stand.", "green");
 						return 1;
 					}))
-					.then(Commands.literal("button").executes(c -> setLooked(c, "button")))
-					.then(Commands.literal("lights").executes(c -> setLooked(c, "lights")))
-					.then(Commands.literal("reactor").executes(c -> setLooked(c, "reactor")))))
+					.then(Commands.literal("button").executes(c -> setLooked(c, "button")))))
 		);
 		d.register(Commands.literal("au").redirect(node));
+		d.register(Commands.literal("impostor")
+			.executes(c -> {
+				Game.setImpostors(pl(c), null);
+				return 1;
+			})
+			.then(Commands.argument("number", IntegerArgumentType.integer(0, 4)).executes(c -> { Game.setImpostors(pl(c), IntegerArgumentType.getInteger(c, "number"));
+				return 1;
+			})));
+		d.register(Commands.literal("crewmate")
+			.executes(c -> {
+				Game.setCrewmates(pl(c), null);
+				return 1;
+			})
+			.then(Commands.argument("number", IntegerArgumentType.integer(0, 19)).executes(c -> { Game.setCrewmates(pl(c), IntegerArgumentType.getInteger(c, "number"));
+				return 1;
+			})));
 	}
 
 	private static int setLooked(CommandContext<CommandSourceStack> c, String what) throws CommandSyntaxException {
@@ -215,8 +325,7 @@ public final class AmongCommands {
 		MapData.P pos = new MapData.P(b.getX(), b.getY(), b.getZ());
 		switch (what) {
 			case "button" -> Game.map.button = pos;
-			case "lights" -> Game.map.lights = pos;
-			default -> Game.map.reactor = pos;
+			default -> Game.map.button = pos;
 		}
 		Game.map.save();
 		Game.tell(p.getName().getString(), "Map " + what + " set.", "green");
@@ -226,11 +335,16 @@ public final class AmongCommands {
 	private static String setting(String key, int v) {
 		if (Game.phase != Game.Phase.LOBBY) return "Can't change settings during a game.";
 		switch (key) {
-			case "impostors" -> Game.impostors = Math.min(v, 3);
+			case "impostors" -> Game.impostors = Math.min(v, 4);
+			case "crewmates" -> Game.crewmates = Math.min(v, Game.MAX_PLAYERS - 1);
+			case "tasktime" -> Game.taskTime = Math.max(50, Math.min(v, 600));
+			case "easytasks" -> Game.easyTasks = Math.min(v, 8);
+			case "mediumtasks" -> Game.mediumTasks = Math.min(v, 8);
+			case "hardtasks" -> Game.hardTasks = Math.min(v, 6);
+			case "o2easy" -> Game.o2Easy = v != 0;
 			case "shapeshifters" -> Game.shapeshifters = Math.min(v, 3);
 			case "engineers" -> Game.engineers = Math.min(v, 4);
 			case "scientists" -> Game.scientists = Math.min(v, 4);
-			case "tasks" -> Game.taskCount = Math.max(1, Math.min(v, 10));
 			case "killcd" -> Game.killCd = Math.max(5, v);
 			case "discuss" -> Game.discuss = Math.max(5, v);
 			case "vote" -> Game.voteTime = Math.max(5, v);
